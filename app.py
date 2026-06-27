@@ -23,6 +23,7 @@
 from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
+import random
 import joblib
 import os
 import warnings
@@ -89,19 +90,32 @@ DAY_START_HOUR = 8.0   # 8:00 AM
 DAY_END_HOUR = 22.0    # 10:00 PM
 DAY_BUDGET_HOURS = DAY_END_HOUR - DAY_START_HOUR  # 14 hours/day to fill
 
-# Duration in hours by destination_type - the main driver of "how long
-# people linger" (beach/island/nature spots get more time than a quick
-# heritage/city stop).
-DURATION_BY_DESTINATION_TYPE = {
-    "Beach & Island": 3.0,       # pantai/island - lepak lama
-    "Highland & Nature": 2.5,    # includes rivers/waterfalls - lepak lama
-    "Eco & Wildlife": 2.0,
-    "Adventure & Sports": 4.0,   # half-day style (waterpark, adventure parks)
-    "Heritage & Culture": 1.5,
-    "City & Urban": 1.5,
-    "Food & Culinary": 1.5,
+# Duration RANGES in hours by destination_type - each visit gets a
+# random duration within its range (not a single fixed value), since
+# real visit lengths naturally vary (e.g. one beach stop might be a
+# quick 2.5h dip, another a lazy 4h afternoon).
+DURATION_RANGE_BY_DESTINATION_TYPE = {
+    "Beach & Island": (2.5, 4.0),     # pantai/island - lepak lama, variasi
+    "Highland & Nature": (2.0, 3.0),  # includes rivers/waterfalls - lepak lama
+    "Eco & Wildlife": (1.5, 2.5),
+    "Heritage & Culture": (1.0, 1.5),
+    "City & Urban": (1.0, 1.5),
+    "Food & Culinary": (1.0, 1.5),
 }
-DEFAULT_DURATION_HOURS = 1.5
+DEFAULT_DURATION_RANGE = (1.0, 1.5)
+
+# Duration overrides by CATEGORY (checked before destination_type) -
+# Shopping places often fall under destination_type "City & Urban"
+# (which defaults to a quick visit), but people typically spend much
+# longer browsing/shopping than a quick city sightseeing stop.
+DURATION_RANGE_BY_CATEGORY = {
+    "Shopping": (2.5, 3.0),
+}
+
+# Waterpark/adventure-park style places get a fixed long "half-day"
+# duration (not a range) - these are typically booked/priced as a
+# single multi-hour session, not a variable-length casual visit.
+WATERPARK_ADVENTURE_DURATION_HOURS = 5.0
 
 # Maximum number of "main activity" places per day - once this is hit,
 # any remaining time in the day budget is used for a food/relax stop
@@ -142,12 +156,28 @@ WATERPARK_ADVENTURE_KEYWORDS = [
 
 
 def get_place_duration_hours(place_row) -> float:
-    """How many hours a typical visitor spends at this place."""
+    """
+    How many hours a typical visitor spends at this place. Most
+    categories get a RANDOM duration within a realistic range (so two
+    visits to the same type of place don't always take an identical
+    amount of time), except waterpark/adventure-park style places
+    which get a fixed 5h "half-day session" duration.
+    """
     name = str(place_row.get("display_name", place_row.get("place_name", ""))).lower()
     if any(kw in name for kw in WATERPARK_ADVENTURE_KEYWORDS):
-        return 4.0
+        return WATERPARK_ADVENTURE_DURATION_HOURS
+
+    category = place_row.get("category", "")
+    if category == "Adventure & Sports":
+        return WATERPARK_ADVENTURE_DURATION_HOURS
+
+    if category in DURATION_RANGE_BY_CATEGORY:
+        low, high = DURATION_RANGE_BY_CATEGORY[category]
+        return round(random.uniform(low, high), 1)
+
     dest_type = place_row.get("destination_type", "")
-    return DURATION_BY_DESTINATION_TYPE.get(dest_type, DEFAULT_DURATION_HOURS)
+    low, high = DURATION_RANGE_BY_DESTINATION_TYPE.get(dest_type, DEFAULT_DURATION_RANGE)
+    return round(random.uniform(low, high), 1)
 
 
 def is_beach_or_island(place_row) -> bool:
@@ -360,15 +390,23 @@ def split_days(total_days, activities):
             for i, act in enumerate(activities)}
 
 
-def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: float = DAY_BUDGET_HOURS):
+def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: float = DAY_BUDGET_HOURS,
+                                 start_hour: float = DAY_START_HOUR, places_used_so_far: int = 0):
     """
-    Fill one day's time budget by walking down the (already fame +
-    beach-preference sorted) candidate list, taking each place's own
-    estimated duration (get_place_duration_hours) until either the
-    day's hours run out or MAX_PLACES_PER_DAY main-activity places
-    have been scheduled (whichever comes first) - cramming in 8-9
-    quick museum visits in one day isn't realistic even if each is
-    individually short.
+    Fill (part of) one day's time budget by walking down the (already
+    fame + beach-preference sorted) candidate list, taking each
+    place's own estimated duration (get_place_duration_hours) until
+    either the day's remaining hours run out or MAX_PLACES_PER_DAY
+    total places for the day have been scheduled (whichever comes
+    first) - cramming in 8-9 quick museum visits in one day isn't
+    realistic even if each is individually short.
+
+    IMPORTANT: when a day mixes multiple activities (e.g. Nature +
+    Adventure + Shopping all in the same day), this function is
+    called once per activity but must NOT reset the clock or the
+    place-count back to the start of the day each time - start_hour
+    and places_used_so_far carry that shared state forward across
+    calls within the same day (see the caller in /recommend).
 
     Each place is also checked against its category's operating hours
     (get_operating_hours): if starting it now would mean visiting
@@ -379,17 +417,18 @@ def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: floa
     here - they're handled separately as a "check-in" entry appended
     at the end of the day (see pick_accommodation_checkin).
 
-    Returns (chosen_rows: list of (row, start_hour, duration) tuples,
-    remaining_candidates: DataFrame of whatever wasn't used, so the
-    next day/activity can continue from where this one left off).
+    Returns (chosen_rows, remaining_candidates, current_hour,
+    remaining_budget, places_used_total) - the last three values are
+    meant to be threaded into the NEXT call for the same day.
     """
     chosen = []
     used_indices = []
-    current_hour = DAY_START_HOUR
-    remaining_budget = day_budget_hours
+    current_hour = start_hour
+    remaining_budget = max(0.0, day_budget_hours - (start_hour - DAY_START_HOUR))
+    places_used_total = places_used_so_far
 
     for idx, row in candidates.iterrows():
-        if len(chosen) >= MAX_PLACES_PER_DAY:
+        if places_used_total >= MAX_PLACES_PER_DAY:
             break
         if row.get("category") == "Accommodation":
             continue  # handled separately as a check-in entry
@@ -412,11 +451,12 @@ def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: floa
         used_indices.append(idx)
         current_hour = finish_hour
         remaining_budget -= duration
+        places_used_total += 1
         if remaining_budget <= 0.5:
             break
 
     remaining_candidates = candidates.drop(index=used_indices)
-    return chosen, remaining_candidates, current_hour, remaining_budget
+    return chosen, remaining_candidates, current_hour, remaining_budget, places_used_total
 
 
 def pick_filler_stop(user_state: str, current_hour: float, remaining_budget: float, exclude_names: set):
@@ -615,17 +655,11 @@ def recommend():
     total_int  = 1 if is_half else int(total_days)
 
     # ── Day → activity mapping ────────────────────────────────────
+    # Every day mixes ALL selected activities together (e.g. a trip
+    # with Nature + Adventure + Shopping gets some of each on every
+    # day), rather than dedicating entire days to a single activity.
     allocation = {}
-    if is_half or total_int == 1:
-        day_activity_map = {1: activities}
-    else:
-        allocation = split_days(total_int, activities)
-        day_activity_map = {}
-        day_num = 1
-        for act, n_days in allocation.items():
-            for _ in range(n_days):
-                day_activity_map[day_num] = [act]
-                day_num += 1
+    day_activity_map = {day: activities for day in range(1, total_int + 1)}
 
     # ── ML Predictions ────────────────────────────────────────────
     act_preds = {}
@@ -646,11 +680,11 @@ def recommend():
     for act in activities:
         cat   = act_preds[act]["category"]
         top3  = act_preds[act]["top3"]
-        days_for_act = 1 if (is_half or total_int == 1) else allocation.get(act, 1)
-        # n_needed here just sizes the candidate pool (see
-        # query_places_for_activity) - actual day-filling is driven by
-        # each place's own duration, not a fixed count.
-        n_need = max(days_for_act * 6, 12)
+        # Since every day now mixes all activities, each activity's
+        # pool needs to cover places across the WHOLE trip length
+        # (not just a slice of days like the old per-activity-day
+        # allocation did).
+        n_need = max(total_int * 6, 12)
         matched = query_places_for_activity(
             user_state    = data["state"],
             predicted_cat = cat,
@@ -659,12 +693,19 @@ def recommend():
             exclude_names = used,
         )
         act_pools[act] = matched
-        used.update(matched["display_name"].tolist() if len(matched) > 0 else [])
+        # Accommodation-category places are deliberately NOT added to
+        # `used` here - they're skipped by the round-robin allocator
+        # anyway (handled separately as the Day-1 check-in entry), so
+        # marking them "used" at this stage would wrongly make them
+        # unavailable for pick_accommodation_checkin later.
+        non_accommodation_names = matched.loc[
+            matched["category"] != "Accommodation", "display_name"
+        ].tolist() if len(matched) > 0 else []
+        used.update(non_accommodation_names)
 
     # ── Build itinerary JSON using the smart duration allocator ────
     itinerary  = []
     all_places = []
-    day_budget = 7.0 if is_half else DAY_BUDGET_HOURS
 
     for day_num in sorted(day_activity_map.keys()):
         day_acts  = day_activity_map[day_num]
@@ -673,94 +714,167 @@ def recommend():
         day_places_list = []
         day_used_names = set()
 
-        # Pull from each of today's activity pools, filling the day's
-        # time budget by each place's own duration (beach/island and
-        # adventure/waterpark places consume more hours than a quick
-        # heritage/city stop, so a day's final place count varies).
+        # Shared state across all of today's activities - this is
+        # what makes "mix all activities into one day" actually work:
+        # without carrying this forward, each activity would otherwise
+        # get its own fresh 14-hour day (effectively cramming several
+        # days' worth of places into one).
+        day_current_hour = DAY_START_HOUR
+        day_remaining_budget = 7.0 if is_half else DAY_BUDGET_HOURS
+        day_places_used = 0
+
+        # Round-robin across today's activities - take ONE place from
+        # each activity's pool in turn, looping back around, instead
+        # of letting the first activity (e.g. Nature) consume the
+        # entire day's budget before the others ever get a turn. This
+        # is what actually makes "mix all activities into one day"
+        # work fairly.
+        #
+        # Implemented with simple per-activity row pointers (not a
+        # while-loop draining pools) so it's guaranteed to terminate:
+        # each activity's pointer only moves forward, and the outer
+        # loop runs at most len(day_acts) * MAX_PLACES_PER_DAY times.
+        act_pointers = {act: 0 for act in day_acts}
+        act_rows = {act: act_pools[act].reset_index(drop=True) for act in day_acts}
+
+        max_rounds = MAX_PLACES_PER_DAY + 2  # small safety margin
+        for _round in range(max_rounds):
+
+            if day_places_used >= MAX_PLACES_PER_DAY or day_remaining_budget <= 0.5:
+                break
+
+            made_progress_this_round = False
+
+            for act in day_acts:
+
+                if day_places_used >= MAX_PLACES_PER_DAY or day_remaining_budget <= 0.5:
+                    break
+
+                rows = act_rows[act]
+                ptr = act_pointers[act]
+
+                # Find the next row for this activity that actually
+                # fits (skip ones that fail operating-hours/budget
+                # checks, without ever moving ptr backward).
+                placed = False
+                while ptr < len(rows):
+
+                    candidate_row = rows.iloc[ptr]
+                    ptr += 1
+
+                    if candidate_row.get("category") == "Accommodation":
+                        continue
+
+                    name = str(candidate_row.get("display_name", ""))
+                    if name in day_used_names:
+                        continue
+
+                    duration = get_place_duration_hours(candidate_row)
+                    category = candidate_row.get("category", "")
+                    open_hour, close_hour = get_operating_hours(category)
+
+                    effective_start = max(day_current_hour, open_hour)
+                    finish_hour = effective_start + duration
+
+                    if effective_start >= close_hour or finish_hour > close_hour:
+                        continue
+                    if duration > day_remaining_budget:
+                        continue
+
+                    state = str(candidate_row.get("state", data["state"]))
+                    link, link_type = get_more_info_link(candidate_row, name, state)
+                    place_obj = {
+                        "time_slot":     format_time_range(effective_start, duration),
+                        "place_name":    name,
+                        "category":      str(candidate_row.get("category", "")),
+                        "duration_hours": duration,
+                        "rating":        round(float(candidate_row.get("rating_imputed", 0)), 1),
+                        "more_info_url": link,
+                        "link_type":     link_type,
+                        "match_quality": str(candidate_row.get("match_quality", "")),
+                        "state":         state,
+                    }
+                    day_places_list.append(place_obj)
+                    all_places.append(place_obj)
+                    day_used_names.add(name)
+
+                    day_current_hour = finish_hour
+                    day_remaining_budget -= duration
+                    day_places_used += 1
+
+                    placed = True
+                    made_progress_this_round = True
+                    break  # this activity gets exactly one place this round
+
+                act_pointers[act] = ptr
+
+            if not made_progress_this_round:
+                break  # no activity could place anything this round - stop early
+
+        # Carry forward whatever each activity's pool didn't use today,
+        # so tomorrow continues from where today left off.
         for act in day_acts:
-            pool = act_pools[act]
-            if pool.empty:
-                continue
-            chosen, remaining_pool, current_hour, remaining_budget = allocate_places_by_duration(pool, day_budget)
-            act_pools[act] = remaining_pool  # so tomorrow continues from where today left off
+            used_ptr = act_pointers[act]
+            act_pools[act] = act_rows[act].iloc[used_ptr:].reset_index(drop=True)
 
-            for p, start_hour, duration in chosen:
-                name  = str(p.get("display_name", ""))
-                if name in day_used_names:
-                    continue
-                state = str(p.get("state", data["state"]))
-                link, link_type = get_more_info_link(p, name, state)
-                place_obj = {
-                    "time_slot":     format_time_range(start_hour, duration),
-                    "place_name":    name,
-                    "category":      str(p.get("category", "")),
-                    "duration_hours": duration,
-                    "rating":        round(float(p.get("rating_imputed", 0)), 1),
-                    "more_info_url": link,
-                    "link_type":     link_type,
-                    "match_quality": str(p.get("match_quality", "")),
-                    "state":         state,
-                }
-                day_places_list.append(place_obj)
-                all_places.append(place_obj)
-                day_used_names.add(name)
-
-            # If the day still has worthwhile time left after the main
-            # activity places, use it for a food/relax stop rather than
-            # squeezing in more sightseeing.
-            filler, _ = pick_filler_stop(
-                user_state=data["state"],
-                current_hour=current_hour,
-                remaining_budget=remaining_budget,
-                exclude_names=used | day_used_names,
-            )
-            if filler is not None:
-                f_row, f_start, f_duration = filler
-                f_name = str(f_row.get("display_name", ""))
-                f_state = str(f_row.get("state", data["state"]))
-                f_link, f_link_type = get_more_info_link(f_row, f_name, f_state)
-                filler_obj = {
-                    "time_slot":     format_time_range(f_start, f_duration),
-                    "place_name":    f_name,
-                    "category":      "Food & Dining",
-                    "duration_hours": f_duration,
-                    "rating":        round(float(f_row.get("rating_imputed", 0)), 1),
-                    "more_info_url": f_link,
-                    "link_type":     f_link_type,
-                    "match_quality": "filler",
-                    "state":         f_state,
-                }
-                day_places_list.append(filler_obj)
-                all_places.append(filler_obj)
-                day_used_names.add(f_name)
-
-            day_budget = 7.0 if is_half else DAY_BUDGET_HOURS  # reset for next day
-
-        # ── Accommodation check-in (only if relevant to this user) ──
-        primary_act = day_acts[0]
-        checkin_row = pick_accommodation_checkin(
-            user_prefs={**user_prefs, "activity_interest": primary_act},
+        # If the day still has worthwhile time left after the main
+        # activity places, use it for a food/relax stop rather than
+        # squeezing in more sightseeing.
+        filler, _ = pick_filler_stop(
             user_state=data["state"],
+            current_hour=day_current_hour,
+            remaining_budget=day_remaining_budget,
             exclude_names=used | day_used_names,
         )
-        if checkin_row is not None:
-            name = str(checkin_row.get("display_name", ""))
-            state = str(checkin_row.get("state", data["state"]))
-            link, link_type = get_more_info_link(checkin_row, name, state)
-            checkin_obj = {
-                "time_slot":     "Check-in (6:00 PM onwards)",
-                "place_name":    name,
-                "category":      "Accommodation",
-                "duration_hours": None,
-                "rating":        round(float(checkin_row.get("rating_imputed", 0)), 1),
-                "more_info_url": link,
-                "link_type":     link_type,
-                "match_quality": "accommodation",
-                "state":         state,
+        if filler is not None:
+            f_row, f_start, f_duration = filler
+            f_name = str(f_row.get("display_name", ""))
+            f_state = str(f_row.get("state", data["state"]))
+            f_link, f_link_type = get_more_info_link(f_row, f_name, f_state)
+            filler_obj = {
+                "time_slot":     format_time_range(f_start, f_duration),
+                "place_name":    f_name,
+                "category":      "Food & Dining",
+                "duration_hours": f_duration,
+                "rating":        round(float(f_row.get("rating_imputed", 0)), 1),
+                "more_info_url": f_link,
+                "link_type":     f_link_type,
+                "match_quality": "filler",
+                "state":         f_state,
             }
-            day_places_list.append(checkin_obj)
-            all_places.append(checkin_obj)
-            used.add(name)
+            day_places_list.append(filler_obj)
+            all_places.append(filler_obj)
+            day_used_names.add(f_name)
+
+        # ── Accommodation check-in (only on Day 1, and only if
+        # relevant to this user) - a real traveller checks into their
+        # hotel/resort once at the start of the trip, not every single
+        # day, so this is intentionally NOT repeated for day_num > 1.
+        if day_num == 1:
+            primary_act = day_acts[0]
+            checkin_row = pick_accommodation_checkin(
+                user_prefs={**user_prefs, "activity_interest": primary_act},
+                user_state=data["state"],
+                exclude_names=used | day_used_names,
+            )
+            if checkin_row is not None:
+                name = str(checkin_row.get("display_name", ""))
+                state = str(checkin_row.get("state", data["state"]))
+                link, link_type = get_more_info_link(checkin_row, name, state)
+                checkin_obj = {
+                    "time_slot":     "Check-in (6:00 PM onwards)",
+                    "place_name":    name,
+                    "category":      "Accommodation",
+                    "duration_hours": None,
+                    "rating":        round(float(checkin_row.get("rating_imputed", 0)), 1),
+                    "more_info_url": link,
+                    "link_type":     link_type,
+                    "match_quality": "accommodation",
+                    "state":         state,
+                }
+                day_places_list.append(checkin_obj)
+                all_places.append(checkin_obj)
+                used.add(name)
 
         itinerary.append({
             "day":                day_num,
