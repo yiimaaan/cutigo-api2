@@ -357,8 +357,12 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
     # Fetch a larger pool than n_needed since each place may only take
     # 1.5-4 hours - we want enough options for the day-filling step to
     # choose from, especially once long-duration places (beach/island/
-    # adventure) start eating into the day's time budget.
-    pool_target = max(n_needed * 3, 12)
+    # adventure) start eating into the day's time budget. Capped at a
+    # reasonable ceiling (60) so a long, multi-day trip doesn't demand
+    # an unrealistically large pool that smaller states could never
+    # have, which would otherwise trigger the nationwide fallback even
+    # when the state has plenty of places for the trip's actual length.
+    pool_target = min(max(n_needed * 3, 12), 60)
 
     all_cands = pd.DataFrame()
 
