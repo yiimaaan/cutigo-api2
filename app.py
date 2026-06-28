@@ -219,6 +219,33 @@ def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
 
 VALID_STATES = sorted(places["state"].unique().tolist())
 
+# Catchy title + tagline shown at the top of a trip result, per state -
+# purely presentational (doesn't affect the model or itinerary logic).
+# Titles use each state's well-known Malaysian julukan/nickname
+# (e.g. Penang = "Pulau Mutiara", Sabah = "Negeri Di Bawah Bayu") so
+# results feel locally familiar rather than generic tourism-brochure
+# English. Kuala Lumpur has no widely-used traditional julukan (it's
+# the federal capital, not one of the 13 states), so it keeps a
+# descriptive title instead.
+STATE_TAGLINES = {
+    "Johor":           {"title": "Discover Johor, Harimau Selatan",          "tagline": "Permata Selatan, warisan dan semangat juang"},
+    "Kedah":           {"title": "Discover Kedah, Jelapang Padi",            "tagline": "Hamparan sawah padi dan keindahan Langkawi"},
+    "Kelantan":        {"title": "Discover Kelantan, Serambi Mekah",         "tagline": "Tradisi, kraf tangan, dan budaya Pantai Timur"},
+    "Kuala Lumpur":    {"title": "Discover Kuala Lumpur",                    "tagline": "Jantung bandar raya, gemerlap menara dan budaya"},
+    "Melaka":          {"title": "Discover Melaka, Bandaraya Bersejarah",    "tagline": "The Historic State di tebing Selat Melaka"},
+    "Negeri Sembilan": {"title": "Discover Negeri Sembilan, Negeri Beradat", "tagline": "Adat dan budaya yang masih dipelihara"},
+    "Pahang":          {"title": "Discover Pahang, Negeri Tok Gajah",        "tagline": "Malaysia Truly Asia's Adventure Destination"},
+    "Penang":          {"title": "Discover Penang, Pulau Mutiara",           "tagline": "Pearl of the Orient - seni, warisan, dan kuliner"},
+    "Perak":           {"title": "Discover Perak, Darul Ridzuan",            "tagline": "Land of Grace - gua kapur dan bandar lama"},
+    "Perlis":          {"title": "Discover Perlis, Indera Kayangan",         "tagline": "Negeri terkecil dengan keindahan luar bandar"},
+    "Sabah":           {"title": "Discover Sabah, Negeri Di Bawah Bayu",     "tagline": "Land Below the Wind - gunung, hutan, dan laut"},
+    "Sarawak":         {"title": "Discover Sarawak, Bumi Kenyalang",         "tagline": "Land of the Hornbills - gua purba dan budaya"},
+    "Selangor":        {"title": "Discover Selangor",                       "tagline": "The Gateway to Malaysia - tema taman dan bandar"},
+    "Terengganu":      {"title": "Discover Terengganu, Gerbang Pantai Timur", "tagline": "Negeri Warisan Pesisir Air yang jernih"},
+}
+
+DEFAULT_TAGLINE = {"title": "Your Malaysia Adventure", "tagline": "A trip built just for you"}
+
 VALID_ACTIVITIES = [
     "Nature", "Sightseeing", "Culture", "Shopping",
     "Food", "Adventure", "Entertainment", "Relaxation"
@@ -649,10 +676,28 @@ def recommend():
     }
 
     # ── Days calculation ──────────────────────────────────────────
+    # trip_duration is a category bucket (Half Day / 1 Day / 2-3 Days /
+    # 4-7 Days / 1 Week+) used for the ML model's prediction. The
+    # ACTUAL number of itinerary days to build comes from actual_days
+    # when the client provides it (e.g. 2, not the "2-3 Days" bucket's
+    # fixed default of 3) - this fixes picking exactly N days
+    # producing an itinerary with the wrong number of days.
     duration   = data["trip_duration"]
-    total_days = DURATION_TO_DAYS.get(duration, 1)
-    is_half    = (total_days == 0.5)
-    total_int  = 1 if is_half else int(total_days)
+    actual_days = data.get("actual_days")
+
+    is_half = (duration == "Half Day")
+
+    if is_half:
+        total_int = 1
+    elif actual_days is not None:
+        try:
+            total_int = max(1, int(actual_days))
+        except (TypeError, ValueError):
+            total_int = int(DURATION_TO_DAYS.get(duration, 1))
+    else:
+        # Fallback for older clients that don't send actual_days yet
+        total_days = DURATION_TO_DAYS.get(duration, 1)
+        total_int = 1 if total_days == 0.5 else int(total_days)
 
     # ── Day → activity mapping ────────────────────────────────────
     # Every day mixes ALL selected activities together (e.g. a trip
@@ -876,11 +921,24 @@ def recommend():
                 all_places.append(checkin_obj)
                 used.add(name)
 
+        # A more descriptive label than the generic "Mixed" - since
+        # every day now combines all selected activities, joining
+        # their names (e.g. "Nature & Shopping") is far more useful
+        # to show in the UI than a vague "Mixed".
+        if len(day_acts) == 1:
+            day_activity_label = day_acts[0]
+            day_predicted_category = act_preds[day_acts[0]]["category"]
+        else:
+            day_activity_label = " & ".join(day_acts)
+            day_predicted_category = " & ".join(
+                sorted(set(act_preds[a]["category"] for a in day_acts))
+            )
+
         itinerary.append({
             "day":                day_num,
             "day_label":          day_label,
-            "activity":           day_acts[0] if len(day_acts) == 1 else "Mixed",
-            "predicted_category": act_preds[day_acts[0]]["category"] if len(day_acts) == 1 else "Mixed",
+            "activity":           day_activity_label,
+            "predicted_category": day_predicted_category,
             "places":             day_places_list,
         })
 
@@ -891,8 +949,12 @@ def recommend():
         for act, n in allocation.items()
     ] if allocation else []
 
+    state_tagline = STATE_TAGLINES.get(data["state"], DEFAULT_TAGLINE)
+
     trip_summary = {
         "state":          data["state"],
+        "title":          state_tagline["title"],
+        "tagline":        state_tagline["tagline"],
         "duration":       duration,
         "total_days":     total_int,
         "activities":     activities,
