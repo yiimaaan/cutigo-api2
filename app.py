@@ -102,6 +102,12 @@ DURATION_RANGE_BY_DESTINATION_TYPE = {
     "City & Urban": (1.0, 1.5),
     "Food & Culinary": (1.0, 1.5),
 }
+# Maximum number of pool candidates scanned per activity per
+# round-robin round, used as a safety net so a string of late-day
+# rejections can't silently exhaust an entire pool (see the
+# day-building loop below for the full explanation).
+MAX_SCAN_PER_ROUND = 15
+
 DEFAULT_DURATION_RANGE = (1.0, 1.5)
 
 # Duration overrides by CATEGORY (checked before destination_type) -
@@ -140,6 +146,28 @@ OPERATING_HOURS_BY_CATEGORY = {
     "Food & Dining":         (8.0, 22.0),
 }
 DEFAULT_OPERATING_HOURS = (8.0, 20.0)
+
+# The latest closing hour across every category (and the default) -
+# once the day's clock passes this, NOTHING in the dataset could
+# possibly still be open, so the round-robin loop can safely stop
+# scanning for today without exhausting the rest of the pool (see the
+# early-exit check in the day-building loop below). This is what
+# fixes a bug where a day running late into the evening would scan
+# (and incorrectly consume) the ENTIRE remaining pool while rejecting
+# every entry on hours alone, leaving nothing for the following days.
+LATEST_CLOSING_HOUR = max(
+    [h[1] for h in OPERATING_HOURS_BY_CATEGORY.values()] + [DEFAULT_OPERATING_HOURS[1]]
+)
+
+# The shortest possible visit duration across all duration ranges -
+# once less time than this remains in the day, nothing in the pool
+# could possibly fit regardless of category, so the early-exit check
+# above uses this as a safety floor.
+MIN_POSSIBLE_DURATION_HOURS = min(
+    [r[0] for r in DURATION_RANGE_BY_DESTINATION_TYPE.values()]
+    + [r[0] for r in DURATION_RANGE_BY_CATEGORY.values()]
+    + [DEFAULT_DURATION_RANGE[0]]
+)
 
 
 def get_operating_hours(category: str):
@@ -810,10 +838,32 @@ def recommend():
                 # fits (skip ones that fail operating-hours/budget
                 # checks, without ever moving ptr backward).
                 placed = False
+                scan_count = 0
                 while ptr < len(rows):
+
+                    # Early exit 1: nothing can fit if we're already
+                    # past the latest closing hour any category uses,
+                    # or there's less time left than the shortest
+                    # possible visit.
+                    if day_current_hour >= LATEST_CLOSING_HOUR or day_remaining_budget < MIN_POSSIBLE_DURATION_HOURS:
+                        break
+
+                    # Early exit 2 (safety net): cap how many
+                    # candidates get scanned per activity per round.
+                    # Late in the day, EVERY remaining candidate can
+                    # legitimately fail (operating hours / random
+                    # duration not fitting what's left), and without
+                    # this cap the inner loop would silently scan (and
+                    # thus exhaust) the ENTIRE remaining pool just to
+                    # confirm that - wrongly leaving nothing for future
+                    # days. Stopping after MAX_SCAN_PER_ROUND lets the
+                    # untried remainder correctly carry forward.
+                    if scan_count >= MAX_SCAN_PER_ROUND:
+                        break
 
                     candidate_row = rows.iloc[ptr]
                     ptr += 1
+                    scan_count += 1
 
                     if candidate_row.get("category") == "Accommodation":
                         continue
