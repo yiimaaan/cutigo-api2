@@ -102,12 +102,6 @@ DURATION_RANGE_BY_DESTINATION_TYPE = {
     "City & Urban": (1.0, 1.5),
     "Food & Culinary": (1.0, 1.5),
 }
-# Maximum number of pool candidates scanned per activity per
-# round-robin round, used as a safety net so a string of late-day
-# rejections can't silently exhaust an entire pool (see the
-# day-building loop below for the full explanation).
-MAX_SCAN_PER_ROUND = 15
-
 DEFAULT_DURATION_RANGE = (1.0, 1.5)
 
 # Duration overrides by CATEGORY (checked before destination_type) -
@@ -146,28 +140,6 @@ OPERATING_HOURS_BY_CATEGORY = {
     "Food & Dining":         (8.0, 22.0),
 }
 DEFAULT_OPERATING_HOURS = (8.0, 20.0)
-
-# The latest closing hour across every category (and the default) -
-# once the day's clock passes this, NOTHING in the dataset could
-# possibly still be open, so the round-robin loop can safely stop
-# scanning for today without exhausting the rest of the pool (see the
-# early-exit check in the day-building loop below). This is what
-# fixes a bug where a day running late into the evening would scan
-# (and incorrectly consume) the ENTIRE remaining pool while rejecting
-# every entry on hours alone, leaving nothing for the following days.
-LATEST_CLOSING_HOUR = max(
-    [h[1] for h in OPERATING_HOURS_BY_CATEGORY.values()] + [DEFAULT_OPERATING_HOURS[1]]
-)
-
-# The shortest possible visit duration across all duration ranges -
-# once less time than this remains in the day, nothing in the pool
-# could possibly fit regardless of category, so the early-exit check
-# above uses this as a safety floor.
-MIN_POSSIBLE_DURATION_HOURS = min(
-    [r[0] for r in DURATION_RANGE_BY_DESTINATION_TYPE.values()]
-    + [r[0] for r in DURATION_RANGE_BY_CATEGORY.values()]
-    + [DEFAULT_DURATION_RANGE[0]]
-)
 
 
 def get_operating_hours(category: str):
@@ -364,7 +336,6 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
     Query places DB with fallback strategy:
     1. Same state + predicted category
     2. Same state + related categories
-    3. Nationwide + predicted category
 
     Within each tier, places are ranked by is_famous (Google Places /
     anchor-list landmarks preferred) as a 'famous/established' proxy -
@@ -387,9 +358,7 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
     # choose from, especially once long-duration places (beach/island/
     # adventure) start eating into the day's time budget. Capped at a
     # reasonable ceiling (60) so a long, multi-day trip doesn't demand
-    # an unrealistically large pool that smaller states could never
-    # have, which would otherwise trigger the nationwide fallback even
-    # when the state has plenty of places for the trip's actual length.
+    # an unrealistically large candidate pool from a smaller state.
     pool_target = min(max(n_needed * 3, 12), 60)
 
     all_cands = pd.DataFrame()
@@ -419,18 +388,14 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
             if len(all_cands) >= pool_target:
                 break
 
-    # Priority 3: nationwide fallback
-    if len(all_cands) < pool_target:
-        p3 = places[
-            (places["category"] == predicted_cat) &
-            (~places["display_name"].isin(
-                set(all_cands["display_name"]) | exclude_names
-            ))
-        ].copy()
-        p3["match_quality"] = "nationwide"
-        all_cands = pd.concat([all_cands, p3])
-
     if len(all_cands) == 0:
+        return pd.DataFrame()
+
+    # State is a hard constraint. Never fill a short candidate pool
+    # with places from another state; a shorter in-state itinerary is
+    # more accurate than recommending an unrelated distant location.
+    all_cands = all_cands[all_cands["state"] == user_state].copy()
+    if all_cands.empty:
         return pd.DataFrame()
 
     all_cands = all_cands.drop_duplicates(subset=["display_name"])
@@ -838,38 +803,23 @@ def recommend():
                 # fits (skip ones that fail operating-hours/budget
                 # checks, without ever moving ptr backward).
                 placed = False
-                scan_count = 0
                 while ptr < len(rows):
-
-                    # Early exit 1: nothing can fit if we're already
-                    # past the latest closing hour any category uses,
-                    # or there's less time left than the shortest
-                    # possible visit.
-                    if day_current_hour >= LATEST_CLOSING_HOUR or day_remaining_budget < MIN_POSSIBLE_DURATION_HOURS:
-                        break
-
-                    # Early exit 2 (safety net): cap how many
-                    # candidates get scanned per activity per round.
-                    # Late in the day, EVERY remaining candidate can
-                    # legitimately fail (operating hours / random
-                    # duration not fitting what's left), and without
-                    # this cap the inner loop would silently scan (and
-                    # thus exhaust) the ENTIRE remaining pool just to
-                    # confirm that - wrongly leaving nothing for future
-                    # days. Stopping after MAX_SCAN_PER_ROUND lets the
-                    # untried remainder correctly carry forward.
-                    if scan_count >= MAX_SCAN_PER_ROUND:
-                        break
 
                     candidate_row = rows.iloc[ptr]
                     ptr += 1
-                    scan_count += 1
 
                     if candidate_row.get("category") == "Accommodation":
                         continue
 
                     name = str(candidate_row.get("display_name", ""))
                     if name in day_used_names:
+                        continue
+
+                    # Defence-in-depth: even if a future query/fallback
+                    # accidentally adds another state to an activity
+                    # pool, it must never reach the itinerary response.
+                    candidate_state = str(candidate_row.get("state", "")).strip()
+                    if candidate_state != data["state"]:
                         continue
 
                     duration = get_place_duration_hours(candidate_row)
@@ -884,7 +834,7 @@ def recommend():
                     if duration > day_remaining_budget:
                         continue
 
-                    state = str(candidate_row.get("state", data["state"]))
+                    state = candidate_state
                     link, link_type = get_more_info_link(candidate_row, name, state)
                     place_obj = {
                         "time_slot":     format_time_range(effective_start, duration),
