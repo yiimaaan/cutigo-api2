@@ -251,6 +251,34 @@ VALID_ACTIVITIES = [
     "Food", "Adventure", "Entertainment", "Relaxation"
 ]
 
+# A selected activity is a user requirement, while the ML prediction is
+# a useful ranking signal. In particular, selecting Shopping must always
+# search the Shopping category first even if the model predicts a nearby
+# category such as Heritage & Museum for the full preference combination.
+ACTIVITY_PRIMARY_CATEGORIES = {
+    "Nature":        "Nature & Outdoors",
+    "Sightseeing":   "Sightseeing & Tours",
+    "Culture":       "Heritage & Museum",
+    "Shopping":      "Shopping",
+    "Food":          "Food & Dining",
+    "Adventure":     "Adventure & Sports",
+    "Entertainment": "Entertainment",
+}
+
+# The dataset's is_famous flag intentionally includes every Google Places
+# row, so many small venues share the same fame tier as national icons.
+# This short priority list breaks that tie for the best-known landmarks.
+ICONIC_PLACE_PRIORITY = {
+    "the national museum of malaysia": 100,
+    "central market":                   100,
+    "the exchange trx":                 100,
+    "petronas twin towers":              95,
+    "merdeka square":                     95,
+    "national mosque":                    95,
+    "islamic arts museum malaysia":       95,
+    "kl tower":                           95,
+}
+
 VALID_BUDGETS       = ["Budget", "Moderate", "Premium", "Luxury"]
 VALID_DURATIONS     = ["Half Day", "1 Day", "2-3 Days", "4-7 Days", "1 Week+"]
 VALID_GROUPS        = ["Solo", "Couple", "Family", "Group of Friends"]
@@ -322,12 +350,20 @@ def _rank_by_fame_proxy(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     df = df.copy()
+    df["_iconic_rank"] = (
+        df["display_name"].astype(str).str.strip().str.lower()
+        .map(ICONIC_PLACE_PRIORITY).fillna(0).astype(int)
+    )
     if "is_famous" in df.columns:
         df["_fame_rank"] = df["is_famous"].astype(int)
     else:
         # fallback if is_famous column isn't present in the CSV yet
         df["_fame_rank"] = (df["source"] == "Google Places").astype(int)
-    return df.sort_values("_fame_rank", ascending=False, kind="stable")
+    return df.sort_values(
+        ["_iconic_rank", "_fame_rank"],
+        ascending=[False, False],
+        kind="stable",
+    )
 
 
 def query_places_for_activity(user_state, predicted_cat, top3_cats,
@@ -731,23 +767,30 @@ def recommend():
         # multiplier is needed so later days don't run out of
         # candidates even on longer trips.
         n_need = max(total_int * MAX_PLACES_PER_DAY * 2, 20)
+        # Search the category explicitly requested by the user first.
+        # Keep the model's remaining top categories as same-state
+        # fallbacks, preserving the existing ML behaviour when the
+        # requested category has only a small number of places.
+        query_cat = ACTIVITY_PRIMARY_CATEGORIES.get(act, cat)
+        query_top3 = [{"category": query_cat, "confidence": 100.0}]
+        query_top3.extend(
+            item for item in top3
+            if item["category"] != query_cat
+        )
+
         matched = query_places_for_activity(
             user_state    = data["state"],
-            predicted_cat = cat,
-            top3_cats     = top3,
+            predicted_cat = query_cat,
+            top3_cats     = query_top3,
             n_needed      = n_need,
             exclude_names = used,
         )
         act_pools[act] = matched
-        # Accommodation-category places are deliberately NOT added to
-        # `used` here - they're skipped by the round-robin allocator
-        # anyway (handled separately as the Day-1 check-in entry), so
-        # marking them "used" at this stage would wrongly make them
-        # unavailable for pick_accommodation_checkin later.
-        non_accommodation_names = matched.loc[
-            matched["category"] != "Accommodation", "display_name"
-        ].tolist() if len(matched) > 0 else []
-        used.update(non_accommodation_names)
+        # Do not mark the whole candidate pool as used here. Doing so
+        # lets the first activity reserve places that it may never
+        # schedule, starving later activities (for example Heritage
+        # reserving Central Market/TRX before Shopping gets its turn).
+        # A name becomes used only when it is actually scheduled below.
 
     # ── Build itinerary JSON using the smart duration allocator ────
     itinerary  = []
@@ -812,7 +855,7 @@ def recommend():
                         continue
 
                     name = str(candidate_row.get("display_name", ""))
-                    if name in day_used_names:
+                    if name in used or name in day_used_names:
                         continue
 
                     # Defence-in-depth: even if a future query/fallback
@@ -850,6 +893,7 @@ def recommend():
                     day_places_list.append(place_obj)
                     all_places.append(place_obj)
                     day_used_names.add(name)
+                    used.add(name)
 
                     day_current_hour = finish_hour
                     day_remaining_budget -= duration
@@ -898,6 +942,7 @@ def recommend():
             day_places_list.append(filler_obj)
             all_places.append(filler_obj)
             day_used_names.add(f_name)
+            used.add(f_name)
 
         # ── Accommodation check-in (only on Day 1, and only if
         # relevant to this user) - a real traveller checks into their
