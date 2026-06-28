@@ -24,6 +24,7 @@ from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
 import random
+import math
 import joblib
 import os
 import warnings
@@ -122,6 +123,11 @@ WATERPARK_ADVENTURE_DURATION_HOURS = 5.0
 # instead of cramming in more sightseeing (e.g. 9 museums in one day
 # isn't realistic, even if each one is individually short).
 MAX_PLACES_PER_DAY = 6
+
+# Do not exhaust an activity's entire remaining pool while searching
+# for one late-day place that still fits. Candidates rejected because
+# of time/budget are deferred to the next day.
+MAX_SCAN_PER_ACTIVITY_PER_ROUND = 15
 
 # Operating hours by category - heritage sites/museums/religious sites
 # typically close in the late afternoon/early evening, while
@@ -908,18 +914,46 @@ def recommend():
         # loop runs at most len(day_acts) * MAX_PLACES_PER_DAY times.
         act_pointers = {act: 0 for act in day_acts}
         act_rows = {act: act_pools[act].reset_index(drop=True) for act in day_acts}
+        act_deferred_rows = {act: [] for act in day_acts}
+
+        # Spread a limited pool across all remaining trip days instead
+        # of consuming six places early and leaving later days empty.
+        # Examples: 12 unique places / 4 days -> 3 per day;
+        # 8 unique places / 4 days -> 2 per day.
+        days_remaining = total_int - day_num + 1
+        remaining_unique_names = set()
+        for act in day_acts:
+            for _, candidate in act_rows[act].iterrows():
+                candidate_name = str(candidate.get("display_name", ""))
+                candidate_state = str(candidate.get("state", "")).strip()
+                if (
+                    candidate_name and
+                    candidate_name not in used and
+                    candidate_state == data["state"] and
+                    candidate.get("category") != "Accommodation"
+                ):
+                    remaining_unique_names.add(candidate_name)
+
+        available_unique_count = len(remaining_unique_names)
+        if available_unique_count:
+            day_place_limit = min(
+                MAX_PLACES_PER_DAY,
+                max(1, math.ceil(available_unique_count / days_remaining)),
+            )
+        else:
+            day_place_limit = 0
 
         max_rounds = MAX_PLACES_PER_DAY + 2  # small safety margin
         for _round in range(max_rounds):
 
-            if day_places_used >= MAX_PLACES_PER_DAY or day_remaining_budget <= 0.5:
+            if day_places_used >= day_place_limit or day_remaining_budget <= 0.5:
                 break
 
             made_progress_this_round = False
 
             for act in day_acts:
 
-                if day_places_used >= MAX_PLACES_PER_DAY or day_remaining_budget <= 0.5:
+                if day_places_used >= day_place_limit or day_remaining_budget <= 0.5:
                     break
 
                 rows = act_rows[act]
@@ -929,10 +963,15 @@ def recommend():
                 # fits (skip ones that fail operating-hours/budget
                 # checks, without ever moving ptr backward).
                 placed = False
-                while ptr < len(rows):
+                scanned_this_round = 0
+                while (
+                    ptr < len(rows) and
+                    scanned_this_round < MAX_SCAN_PER_ACTIVITY_PER_ROUND
+                ):
 
                     candidate_row = rows.iloc[ptr]
                     ptr += 1
+                    scanned_this_round += 1
 
                     if candidate_row.get("category") == "Accommodation":
                         continue
@@ -956,8 +995,10 @@ def recommend():
                     finish_hour = effective_start + duration
 
                     if effective_start >= close_hour or finish_hour > close_hour:
+                        act_deferred_rows[act].append(candidate_row)
                         continue
                     if duration > day_remaining_budget:
+                        act_deferred_rows[act].append(candidate_row)
                         continue
 
                     state = candidate_state
@@ -991,11 +1032,19 @@ def recommend():
             if not made_progress_this_round:
                 break  # no activity could place anything this round - stop early
 
-        # Carry forward whatever each activity's pool didn't use today,
-        # so tomorrow continues from where today left off.
+        # Carry forward both untried rows and rows that did not fit
+        # today's time/operating-hour constraints. Deferred rows are
+        # placed first because they may fit naturally tomorrow morning.
         for act in day_acts:
             used_ptr = act_pointers[act]
-            act_pools[act] = act_rows[act].iloc[used_ptr:].reset_index(drop=True)
+            deferred_df = pd.DataFrame(act_deferred_rows[act])
+            untried_df = act_rows[act].iloc[used_ptr:]
+            carried = pd.concat([deferred_df, untried_df], ignore_index=True)
+            if not carried.empty:
+                carried = carried.drop_duplicates(
+                    subset=["display_name"], keep="first"
+                )
+            act_pools[act] = carried.reset_index(drop=True)
 
         # If the day still has worthwhile time left after the main
         # activity places, use it for a food/relax stop rather than
