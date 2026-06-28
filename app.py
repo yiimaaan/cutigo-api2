@@ -213,9 +213,16 @@ def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
         return candidate_places
     df = candidate_places.copy()
     df["_beach_pref"] = df.apply(is_beach_or_island, axis=1).astype(int)
-    # keep existing fame-based order as the primary sort, beach
-    # preference as a secondary nudge within the same fame tier
-    return df.sort_values(["_fame_rank", "_beach_pref"], ascending=[False, False], kind="stable")
+    # Curated iconic priority must remain the strongest signal. Fame
+    # comes next, while beach preference is only a gentle tiebreaker.
+    sort_columns = ["_fame_rank", "_beach_pref"]
+    if "_iconic_rank" in df.columns:
+        sort_columns.insert(0, "_iconic_rank")
+    return df.sort_values(
+        sort_columns,
+        ascending=[False] * len(sort_columns),
+        kind="stable",
+    )
 
 VALID_STATES = sorted(places["state"].unique().tolist())
 
@@ -267,16 +274,92 @@ ACTIVITY_PRIMARY_CATEGORIES = {
 
 # The dataset's is_famous flag intentionally includes every Google Places
 # row, so many small venues share the same fame tier as national icons.
-# This short priority list breaks that tie for the best-known landmarks.
+# This curated nationwide list breaks that tie for the best-known
+# landmarks. Names are normalized to lowercase before matching.
 ICONIC_PLACE_PRIORITY = {
+    # Explicit Kuala Lumpur priorities requested during itinerary QA.
     "the national museum of malaysia": 100,
-    "central market":                   100,
-    "the exchange trx":                 100,
-    "petronas twin towers":              95,
-    "merdeka square":                     95,
-    "national mosque":                    95,
-    "islamic arts museum malaysia":       95,
-    "kl tower":                           95,
+    "central market": 100,
+    "the exchange trx": 100,
+
+    # Curated priority_landmarks_table.csv (all 76 rows were verified
+    # as exact state/category/name matches in the master places CSV).
+    "petronas twin towers": 100,
+    "batu caves": 95,
+    "sipadan island": 93,
+    "perhentian islands": 92,
+    "redang island": 90,
+    "taman negara": 88,
+    "genting skyway": 85,
+    "langkawi cable car": 84,
+    "national mosque": 83,
+    "george town street art": 82,
+    "mabul island": 81,
+    "penang hill heritage trail": 81,
+    "crystal mosque": 80,
+    "sarawak cultural village": 79,
+    "poring hot springs": 78,
+    "cherating beach": 78,
+    "pangkor island": 77,
+    "kapas island": 76,
+    "pulau lang tengah": 73,
+    "putra mosque": 72,
+    "bohey dulang island": 71,
+    "sky mirror kuala selangor": 70,
+    "kilim geoforest park": 69,
+    "melaka sultanate palace": 68,
+    "portuguese settlement": 67,
+    "sultan salahuddin abdul aziz mosque": 66,
+    "endau rompin national park": 65,
+    "maritime museum": 64,
+    "labuan marine park": 63,
+    "putrajaya lake": 62,
+    "seri wawasan bridge": 60,
+    "elephant sanctuary kuala gandah": 59,
+    "perdana putra": 58,
+    "jalan alor": 58,
+    "puteri harbour": 57,
+    "escape penang": 56,
+    "chinatown kuala lumpur": 55,
+    "zoo taiping": 54,
+    "sekinchan paddy fields": 53,
+    "taming sari tower": 52,
+    "kuala selangor fireflies": 51,
+    "mahsuri tomb": 50,
+    "cruise tasik putrajaya": 50,
+    "cape rachado lighthouse": 49,
+    "pasar siti khadijah": 48,
+    "putrajaya botanical garden": 47,
+    "entopia butterfly farm": 47,
+    "blue lagoon beach": 46,
+    "tengku tengah zaharah mosque": 45,
+    "frim": 45,
+    "bukit merah laketown": 44,
+    "muhammadi mosque": 44,
+    "millennium monument": 43,
+    "army museum port dickson": 43,
+    "craft museum": 42,
+    "austin heights water park": 42,
+    "sungei lembing": 41,
+    "anjung floria": 41,
+    "terengganu drawbridge": 40,
+    "perdana botanical gardens": 38,
+    "wat photivihan": 37,
+    "jeram toi waterfall": 36,
+    "tasik melati": 35,
+    "jelawang waterfall": 34,
+    "bukit keteri": 33,
+    "pulau papan": 33,
+    "timah tasoh lake": 32,
+    "pd ostrich farm": 31,
+    "snake and reptile farm": 30,
+    "alive 3d art gallery": 28,
+    "bank kerapu": 27,
+    "chimney museum": 26,
+    "peace park": 25,
+    "labuan war cemetery": 24,
+    "surrender point": 23,
+    "financial park": 20,
 }
 
 VALID_BUDGETS       = ["Budget", "Moderate", "Premium", "Luxury"]
