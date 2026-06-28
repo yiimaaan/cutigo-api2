@@ -729,7 +729,11 @@ def recommend():
         # pool needs to cover places across the WHOLE trip length
         # (not just a slice of days like the old per-activity-day
         # allocation did).
-        n_need = max(total_int * 6, 12)
+        # Each day can use up to MAX_PLACES_PER_DAY places, and with
+        # round-robin sharing across multiple activities, a generous
+        # multiplier is needed so later days don't run out of
+        # candidates even on longer trips.
+        n_need = max(total_int * MAX_PLACES_PER_DAY * 2, 20)
         matched = query_places_for_activity(
             user_state    = data["state"],
             predicted_cat = cat,
