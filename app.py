@@ -8,7 +8,7 @@
 #   GET  /states        → list all available states
 #   GET  /activities    → list all activity interests
 #   GET  /places        → search places by name + state (MySQL)
-#   GET  /famous-places → top places by priority_score (MySQL)
+#   GET  /famous-places → top is_famous places (MySQL)
 #   POST /trips         → save a trip (MySQL)
 #   GET  /trips         → list a user's saved trips (MySQL)
 #   PUT  /trips/<id>    → edit a saved trip (MySQL)
@@ -651,7 +651,7 @@ def search_places():
         query += " AND state = %s"
         params.append(state)
 
-    query += " ORDER BY priority_score DESC, rating_imputed DESC LIMIT %s"
+    query += " ORDER BY is_famous DESC, rating_imputed DESC LIMIT %s"
     params.append(limit)
 
     cursor.execute(query, params)
@@ -668,14 +668,14 @@ def search_places():
 
 @app.route("/famous-places", methods=["GET"])
 def get_famous_places():
-    """Top N places by priority_score, for the homepage carousel."""
+    """Top N is_famous places (highest rated first), for the homepage carousel."""
     limit = min(int(request.args.get("limit", 15)), 50)
 
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
-        "SELECT * FROM places WHERE priority_score > 0 "
-        "ORDER BY priority_score DESC LIMIT %s",
+        "SELECT * FROM places WHERE is_famous = 1 "
+        "ORDER BY rating_imputed DESC LIMIT %s",
         (limit,)
     )
     results = cursor.fetchall()
