@@ -714,7 +714,11 @@ def save_trip():
             data.get("group_type"),
             data.get("transportation_preference"),
             data.get("accommodation_preference"),
-            ", ".join(data.get("activity_interest", [])),
+            # activity_interest can arrive as a list ["Nature","Food"] or
+            # a pre-joined string "Nature, Food" - normalise to string.
+            (", ".join(data["activity_interest"])
+             if isinstance(data.get("activity_interest"), list)
+             else str(data.get("activity_interest", ""))),
             json_lib.dumps(data.get("itinerary", [])),
         )
     )
