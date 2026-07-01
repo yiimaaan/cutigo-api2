@@ -208,7 +208,7 @@ def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
 VALID_STATES = sorted(places["state"].unique().tolist())
 
 STATE_TAGLINES = {
-    "Johor":           {"title": "Discover Johor, Harimau Selatan",          "tagline": "Permata Selatan, warisan dan semangat juang"},
+    "Johor":           {"title": "Discover Johor, Negeri Harimau Selatan",          "tagline": "Permata Selatan, warisan dan semangat juang"},
     "Kedah":           {"title": "Discover Kedah, Jelapang Padi",            "tagline": "Hamparan sawah padi dan keindahan Langkawi"},
     "Kelantan":        {"title": "Discover Kelantan, Serambi Mekah",         "tagline": "Tradisi, kraf tangan, dan budaya Pantai Timur"},
     "Kuala Lumpur":    {"title": "Discover Kuala Lumpur",                    "tagline": "Jantung bandar raya, gemerlap menara dan budaya"},
@@ -245,7 +245,13 @@ ICONIC_PLACE_PRIORITY = {
     "the national museum of malaysia": 100,
     "central market": 100,
     "the exchange trx": 100,
-
+    "genting skyworlds theme park": 85,
+    "kl tower": 87,
+    "kinabalu park": 86,
+    "cameron highlands": 80,
+    "batu ferringhi beach": 73,
+    "cameron valley tea view point": 68,
+    "george town, malaysia unesco area": 82,
     "petronas twin towers": 100,
     "batu caves": 95,
     "sipadan island": 93,
@@ -318,10 +324,10 @@ ICONIC_PLACE_PRIORITY = {
     "alive 3d art gallery": 28,
     "bank kerapu": 27,
     "chimney museum": 26,
-    "peace park": 25,
+    "peace park": 15,
     "labuan war cemetery": 24,
     "surrender point": 23,
-    "financial park": 20,
+    "financial park": 10,
 }
 
 VALID_BUDGETS       = ["Budget", "Moderate", "Premium", "Luxury"]
