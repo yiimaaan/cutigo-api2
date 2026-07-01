@@ -208,19 +208,19 @@ def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
 VALID_STATES = sorted(places["state"].unique().tolist())
 
 STATE_TAGLINES = {
-    "Johor":           {"title": "Discover Johor, Negeri Harimau Selatan",          "tagline": "Permata Selatan, warisan dan semangat juang"},
+    "Johor":           {"title": "Discover Johor, Negeri Harimau Selatan",    "tagline": "Permata Selatan, warisan dan semangat juang"},
     "Kedah":           {"title": "Discover Kedah, Jelapang Padi",            "tagline": "Hamparan sawah padi dan keindahan Langkawi"},
     "Kelantan":        {"title": "Discover Kelantan, Serambi Mekah",         "tagline": "Tradisi, kraf tangan, dan budaya Pantai Timur"},
-    "Kuala Lumpur":    {"title": "Discover Kuala Lumpur",                    "tagline": "Jantung bandar raya, gemerlap menara dan budaya"},
+    "Kuala Lumpur":    {"title": "Discover Kuala Lumpur, Kotarayaku",       "tagline": "Jantung kotaraya, gemerlap menara dan budaya"},
     "Melaka":          {"title": "Discover Melaka, Bandaraya Bersejarah",    "tagline": "The Historic State di tebing Selat Melaka"},
     "Negeri Sembilan": {"title": "Discover Negeri Sembilan, Negeri Beradat", "tagline": "Adat dan budaya yang masih dipelihara"},
     "Pahang":          {"title": "Discover Pahang, Negeri Tok Gajah",        "tagline": "Malaysia Truly Asia's Adventure Destination"},
-    "Penang":          {"title": "Discover Penang, Pulau Mutiara",           "tagline": "Pearl of the Orient - seni, warisan, dan kuliner"},
+    "Penang":          {"title": "Discover Penang, Pulau Mutiara",           "tagline": "Pearl of the Orient - seni, warisan, dan syurga makanan"},
     "Perak":           {"title": "Discover Perak, Darul Ridzuan",            "tagline": "Land of Grace - gua kapur dan bandar lama"},
-    "Perlis":          {"title": "Discover Perlis, Indera Kayangan",         "tagline": "Negeri terkecil dengan keindahan luar bandar"},
+    "Perlis":          {"title": "Discover Perlis, Indera Kayangan",         "tagline": "Negeri terkecil dengan keindahan luar biasa!"},
     "Sabah":           {"title": "Discover Sabah, Negeri Di Bawah Bayu",     "tagline": "Land Below the Wind - gunung, hutan, dan laut"},
-    "Sarawak":         {"title": "Discover Sarawak, Bumi Kenyalang",         "tagline": "Land of the Hornbills - gua purba dan budaya"},
-    "Selangor":        {"title": "Discover Selangor",                       "tagline": "The Gateway to Malaysia - tema taman dan bandar"},
+    "Sarawak":         {"title": "Discover Sarawak, Bumi Kenyalang",         "tagline": "Land of the Hornbills - Agi Ngidup, Agi Ngelaban"},
+    "Selangor":        {"title": "Discover Selangor",                       "tagline": "Pusing Selangor Dulu!"},
     "Terengganu":      {"title": "Discover Terengganu, Gerbang Pantai Timur", "tagline": "Negeri Warisan Pesisir Air yang jernih"},
 }
 
