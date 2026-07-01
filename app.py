@@ -111,20 +111,27 @@ DAY_END_HOUR = 22.0    # 10:00 PM
 DAY_BUDGET_HOURS = DAY_END_HOUR - DAY_START_HOUR  # 14 hours/day to fill
 
 DURATION_RANGE_BY_DESTINATION_TYPE = {
-    "Beach & Island": (2.5, 4.0),
-    "Highland & Nature": (2.0, 3.0),
-    "Eco & Wildlife": (1.5, 2.5),
-    "Heritage & Culture": (1.0, 1.5),
-    "City & Urban": (1.0, 1.5),
-    "Food & Culinary": (1.0, 1.5),
+    "Beach & Island": (3.0, 5.0),
+    "Highland & Nature": (3.0, 5.0),
+    "Eco & Wildlife": (3.0, 4.0),
+    "Heritage & Culture": (2.5, 3.5),
+    "City & Urban": (2.5, 3.5),
+    "Food & Culinary": (1.5, 2.5),
 }
-DEFAULT_DURATION_RANGE = (1.0, 1.5)
+DEFAULT_DURATION_RANGE = (2.5, 3.5)
 
 DURATION_RANGE_BY_CATEGORY = {
-    "Shopping": (2.5, 3.0),
+    "Shopping": (2.5, 3.5),
+    "Nature & Outdoors": (3.0, 5.0),
+    "Sightseeing & Tours": (3.0, 4.0),
+    "Adventure & Sports": (3.0, 5.0),
+    "Entertainment": (3.0, 5.0),
+    "Heritage & Museum": (2.5, 3.5),
+    "Religious & Cultural": (2.5, 3.0),
+    "Food & Dining": (1.5, 2.5),
 }
 
-WATERPARK_ADVENTURE_DURATION_HOURS = 5.0
+WATERPARK_ADVENTURE_DURATION_HOURS = 6.0
 
 MAX_PLACES_PER_DAY = 6
 
@@ -134,7 +141,7 @@ OPERATING_HOURS_BY_CATEGORY = {
     "Heritage & Museum":     (8.0, 18.0),
     "Religious & Cultural":  (8.0, 18.0),
     "Sightseeing & Tours":   (8.0, 21.0),
-    "Shopping":              (8.0, 21.0),
+    "Shopping":              (9.0, 22.0),
     "Nature & Outdoors":     (8.0, 22.0),
     "Adventure & Sports":    (8.0, 22.0),
     "Entertainment":         (8.0, 22.0),
@@ -149,7 +156,7 @@ def get_operating_hours(category: str):
 
 WATERPARK_ADVENTURE_KEYWORDS = [
     "water park", "waterpark", "adventure park", "theme park",
-    "escape park", "skyway", "cable car", "luge",
+    "escape park", "skyway", "cable car", "luge", "escape", "legoland",
 ]
 
 
@@ -511,7 +518,7 @@ def pick_filler_stop(user_state: str, current_hour: float, remaining_budget: flo
 
     food_candidates = _rank_by_fame_proxy(food_candidates)
     chosen_row = food_candidates.iloc[0]
-    duration = min(1.5, remaining_budget, close_hour - current_hour)
+    duration = min(2.5, remaining_budget, close_hour - current_hour)
     if duration < 0.5:
         return None, current_hour
 
