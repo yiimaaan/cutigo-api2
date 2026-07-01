@@ -7,6 +7,12 @@
 #   POST /recommend     → main itinerary endpoint
 #   GET  /states        → list all available states
 #   GET  /activities    → list all activity interests
+#   GET  /places        → search places by name + state (MySQL)
+#   GET  /famous-places → top is_famous places (MySQL)
+#   POST /trips         → save a trip (MySQL)
+#   GET  /trips         → list a user's saved trips (MySQL)
+#   PUT  /trips/<id>    → edit a saved trip (MySQL)
+#   DELETE /trips/<id>  → delete a saved trip (MySQL)
 #
 # Folder structure on Render:
 #   /
@@ -28,6 +34,8 @@ import math
 import joblib
 import os
 import warnings
+import mysql.connector
+import json as json_lib
 warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
@@ -44,7 +52,7 @@ rf_model    = joblib.load(os.path.join(MODEL_DIR, "cutigo_rf_model.pkl"))
 feature_enc = joblib.load(os.path.join(MODEL_DIR, "cutigo_encoders.pkl"))
 label_enc   = joblib.load(os.path.join(MODEL_DIR, "cutigo_label_encoders.pkl"))
 le_cat      = label_enc["category"]
-print("[CutiGo] ML models loaded ✅")
+print("[CutiGo] ML models loaded OK")
 
 print("[CutiGo] Loading places database...")
 places = pd.read_csv(os.path.join(DATA_DIR, "cutigo_master_places.csv"))
@@ -52,7 +60,28 @@ if "place_name" in places.columns:
     places["display_name"] = places["place_name"]
 elif "recommended_place" in places.columns:
     places["display_name"] = places["recommended_place"]
-print(f"[CutiGo] {len(places):,} places loaded ✅")
+print(f"[CutiGo] {len(places):,} places loaded OK")
+
+# ================================================================
+# MYSQL CONNECTION (Railway)
+# ----------------------------------------------------------------
+# Reads connection details from environment variables - set these on
+# the cutigo-api2 Railway service (Settings -> Variables), either by
+# copy-pasting from the MySQL service's "Connect" tab, or using
+# Railway's "Add Reference" option to auto-link the MySQL service:
+#   MYSQLHOST, MYSQLPORT, MYSQLUSER, MYSQLPASSWORD, MYSQLDATABASE
+# ================================================================
+
+def get_db_connection():
+    """Open a new MySQL connection using Railway's env vars."""
+    return mysql.connector.connect(
+        host=os.environ.get("MYSQLHOST"),
+        port=int(os.environ.get("MYSQLPORT", 3306)),
+        user=os.environ.get("MYSQLUSER"),
+        password=os.environ.get("MYSQLPASSWORD"),
+        database=os.environ.get("MYSQLDATABASE"),
+    )
+
 
 # ================================================================
 # CONSTANTS
@@ -72,32 +101,18 @@ DURATION_TO_DAYS = {
 }
 
 TIME_SLOTS = {
-    2: ["Morning (9:00 AM – 12:00 PM)", "Afternoon (2:00 PM – 5:00 PM)"],
-    3: ["Morning (9:00 AM – 12:00 PM)", "Afternoon (2:00 PM – 5:00 PM)",
-        "Evening (7:00 PM – 9:00 PM)"],
+    2: ["Morning (9:00 AM - 12:00 PM)", "Afternoon (2:00 PM - 5:00 PM)"],
+    3: ["Morning (9:00 AM - 12:00 PM)", "Afternoon (2:00 PM - 5:00 PM)",
+        "Evening (7:00 PM - 9:00 PM)"],
 }
-
-# ================================================================
-# SMART DURATION ALLOCATION
-# ----------------------------------------------------------------
-# Instead of forcing every place into an equal-size slot, each place
-# gets a duration (in hours) based on its destination_type/category -
-# places where people typically linger (beaches, islands, rivers,
-# waterparks/adventure) get more time than quick-visit spots
-# (heritage sites, city landmarks, food stops).
-# ================================================================
 
 DAY_START_HOUR = 8.0   # 8:00 AM
 DAY_END_HOUR = 22.0    # 10:00 PM
 DAY_BUDGET_HOURS = DAY_END_HOUR - DAY_START_HOUR  # 14 hours/day to fill
 
-# Duration RANGES in hours by destination_type - each visit gets a
-# random duration within its range (not a single fixed value), since
-# real visit lengths naturally vary (e.g. one beach stop might be a
-# quick 2.5h dip, another a lazy 4h afternoon).
 DURATION_RANGE_BY_DESTINATION_TYPE = {
-    "Beach & Island": (2.5, 4.0),     # pantai/island - lepak lama, variasi
-    "Highland & Nature": (2.0, 3.0),  # includes rivers/waterfalls - lepak lama
+    "Beach & Island": (2.5, 4.0),
+    "Highland & Nature": (2.0, 3.0),
     "Eco & Wildlife": (1.5, 2.5),
     "Heritage & Culture": (1.0, 1.5),
     "City & Urban": (1.0, 1.5),
@@ -105,36 +120,16 @@ DURATION_RANGE_BY_DESTINATION_TYPE = {
 }
 DEFAULT_DURATION_RANGE = (1.0, 1.5)
 
-# Duration overrides by CATEGORY (checked before destination_type) -
-# Shopping places often fall under destination_type "City & Urban"
-# (which defaults to a quick visit), but people typically spend much
-# longer browsing/shopping than a quick city sightseeing stop.
 DURATION_RANGE_BY_CATEGORY = {
     "Shopping": (2.5, 3.0),
 }
 
-# Waterpark/adventure-park style places get a fixed long "half-day"
-# duration (not a range) - these are typically booked/priced as a
-# single multi-hour session, not a variable-length casual visit.
 WATERPARK_ADVENTURE_DURATION_HOURS = 5.0
 
-# Maximum number of "main activity" places per day - once this is hit,
-# any remaining time in the day budget is used for a food/relax stop
-# instead of cramming in more sightseeing (e.g. 9 museums in one day
-# isn't realistic, even if each one is individually short).
 MAX_PLACES_PER_DAY = 6
 
-# Do not exhaust an activity's entire remaining pool while searching
-# for one late-day place that still fits. Candidates rejected because
-# of time/budget are deferred to the next day.
 MAX_SCAN_PER_ACTIVITY_PER_ROUND = 15
 
-# Operating hours by category - heritage sites/museums/religious sites
-# typically close in the late afternoon/early evening, while
-# entertainment, beaches, and food venues commonly stay open into the
-# evening. A place's start time is clamped so it can't begin after its
-# category's closing hour, and the visit is skipped for that slot if
-# it wouldn't finish before closing.
 OPERATING_HOURS_BY_CATEGORY = {
     "Heritage & Museum":     (8.0, 18.0),
     "Religious & Cultural":  (8.0, 18.0),
@@ -151,10 +146,7 @@ DEFAULT_OPERATING_HOURS = (8.0, 20.0)
 def get_operating_hours(category: str):
     return OPERATING_HOURS_BY_CATEGORY.get(category, DEFAULT_OPERATING_HOURS)
 
-# Some places are tagged Entertainment/Sightseeing but ARE waterparks/
-# adventure parks by name - these should also get the long "half-day"
-# duration even though their destination_type/category doesn't say
-# "Adventure & Sports".
+
 WATERPARK_ADVENTURE_KEYWORDS = [
     "water park", "waterpark", "adventure park", "theme park",
     "escape park", "skyway", "cable car", "luge",
@@ -162,13 +154,6 @@ WATERPARK_ADVENTURE_KEYWORDS = [
 
 
 def get_place_duration_hours(place_row) -> float:
-    """
-    How many hours a typical visitor spends at this place. Most
-    categories get a RANDOM duration within a realistic range (so two
-    visits to the same type of place don't always take an identical
-    amount of time), except waterpark/adventure-park style places
-    which get a fixed 5h "half-day session" duration.
-    """
     name = str(place_row.get("display_name", place_row.get("place_name", ""))).lower()
     if any(kw in name for kw in WATERPARK_ADVENTURE_KEYWORDS):
         return WATERPARK_ADVENTURE_DURATION_HOURS
@@ -191,7 +176,6 @@ def is_beach_or_island(place_row) -> bool:
 
 
 def format_time_range(start_hour: float, duration: float) -> str:
-    """Format a start hour + duration into a 'H:MM AM/PM – H:MM AM/PM' string."""
     end_hour = start_hour + duration
 
     def fmt(h):
@@ -204,23 +188,14 @@ def format_time_range(start_hour: float, duration: float) -> str:
         minutes = int(round((h - int(h)) * 60))
         return f"{display_h}:{minutes:02d} {period}"
 
-    return f"{fmt(start_hour)} – {fmt(end_hour)}"
+    return f"{fmt(start_hour)} - {fmt(end_hour)}"
 
 
 def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
-    """
-    Reorder candidates so Beach & Island places are pulled toward the
-    front of the queue (so they tend to land in the morning/sunrise
-    slot first) - WITHOUT removing or hard-forcing anything. If a day
-    is already full, a beach place simply lands wherever there's room;
-    this is a soft preference, not a strict scheduling constraint.
-    """
     if candidate_places.empty:
         return candidate_places
     df = candidate_places.copy()
     df["_beach_pref"] = df.apply(is_beach_or_island, axis=1).astype(int)
-    # Curated iconic priority must remain the strongest signal. Fame
-    # comes next, while beach preference is only a gentle tiebreaker.
     sort_columns = ["_fame_rank", "_beach_pref"]
     if "_iconic_rank" in df.columns:
         sort_columns.insert(0, "_iconic_rank")
@@ -232,14 +207,6 @@ def sort_for_beach_preference(candidate_places: pd.DataFrame) -> pd.DataFrame:
 
 VALID_STATES = sorted(places["state"].unique().tolist())
 
-# Catchy title + tagline shown at the top of a trip result, per state -
-# purely presentational (doesn't affect the model or itinerary logic).
-# Titles use each state's well-known Malaysian julukan/nickname
-# (e.g. Penang = "Pulau Mutiara", Sabah = "Negeri Di Bawah Bayu") so
-# results feel locally familiar rather than generic tourism-brochure
-# English. Kuala Lumpur has no widely-used traditional julukan (it's
-# the federal capital, not one of the 13 states), so it keeps a
-# descriptive title instead.
 STATE_TAGLINES = {
     "Johor":           {"title": "Discover Johor, Harimau Selatan",          "tagline": "Permata Selatan, warisan dan semangat juang"},
     "Kedah":           {"title": "Discover Kedah, Jelapang Padi",            "tagline": "Hamparan sawah padi dan keindahan Langkawi"},
@@ -264,10 +231,6 @@ VALID_ACTIVITIES = [
     "Food", "Adventure", "Entertainment", "Relaxation"
 ]
 
-# A selected activity is a user requirement, while the ML prediction is
-# a useful ranking signal. In particular, selecting Shopping must always
-# search the Shopping category first even if the model predicts a nearby
-# category such as Heritage & Museum for the full preference combination.
 ACTIVITY_PRIMARY_CATEGORIES = {
     "Nature":        "Nature & Outdoors",
     "Sightseeing":   "Sightseeing & Tours",
@@ -278,18 +241,11 @@ ACTIVITY_PRIMARY_CATEGORIES = {
     "Entertainment": "Entertainment",
 }
 
-# The dataset's is_famous flag intentionally includes every Google Places
-# row, so many small venues share the same fame tier as national icons.
-# This curated nationwide list breaks that tie for the best-known
-# landmarks. Names are normalized to lowercase before matching.
 ICONIC_PLACE_PRIORITY = {
-    # Explicit Kuala Lumpur priorities requested during itinerary QA.
     "the national museum of malaysia": 100,
     "central market": 100,
     "the exchange trx": 100,
 
-    # Curated priority_landmarks_table.csv (all 76 rows were verified
-    # as exact state/category/name matches in the master places CSV).
     "petronas twin towers": 100,
     "batu caves": 95,
     "sipadan island": 93,
@@ -383,7 +339,6 @@ VALID_ACCOMMODATIONS = [
 # ================================================================
 
 def encode_input(user_prefs, activity_override=None):
-    """Encode user preferences dict into numpy array."""
     prefs = user_prefs.copy()
     if activity_override:
         prefs["activity_interest"] = activity_override
@@ -396,7 +351,6 @@ def encode_input(user_prefs, activity_override=None):
 
 
 def predict_category(user_prefs, activity):
-    """Run RF model for one activity, return top-3 category predictions."""
     arr      = encode_input(user_prefs, activity_override=activity)
     idx      = rf_model.predict(arr)[0]
     proba    = rf_model.predict_proba(arr)[0]
@@ -410,32 +364,16 @@ def predict_category(user_prefs, activity):
 
 
 def get_more_info_link(place_row, place_name, state):
-    """Return best available info link for a place."""
     booking = str(place_row.get("booking_link", ""))
     if booking and booking not in ("nan", "", "None", "NaN"):
         if not booking.startswith("http"):
             booking = "https://" + booking
         return booking, "website"
-    # Fallback: Google Maps search
     query = place_name.replace(" ", "+") + "+" + state.replace(" ", "+")
     return f"https://www.google.com/maps/search/{query}", "google_maps"
 
 
 def _rank_by_fame_proxy(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Order candidate places by a 'famous' proxy instead of rating
-    (ratings in this dataset are inconsistent/unreliable). A place is
-    treated as 'famous' if EITHER:
-      - it matched a curated anchor list of well-known Malaysia
-        landmarks (Petronas Twin Towers, Batu Caves, Cameron
-        Highlands, etc. - see is_famous column, built from
-        travel-authority sources), OR
-      - it has source == 'Google Places' (implies a verified
-        business presence, more reliable than OSM's crowdsourced
-        tags)
-    Famous places are shown first; within the same fame tier,
-    original row order is kept rather than re-sorting by rating.
-    """
     if df.empty:
         return df
     df = df.copy()
@@ -446,7 +384,6 @@ def _rank_by_fame_proxy(df: pd.DataFrame) -> pd.DataFrame:
     if "is_famous" in df.columns:
         df["_fame_rank"] = df["is_famous"].astype(int)
     else:
-        # fallback if is_famous column isn't present in the CSV yet
         df["_fame_rank"] = (df["source"] == "Google Places").astype(int)
     return df.sort_values(
         ["_iconic_rank", "_fame_rank"],
@@ -457,38 +394,13 @@ def _rank_by_fame_proxy(df: pd.DataFrame) -> pd.DataFrame:
 
 def query_places_for_activity(user_state, predicted_cat, top3_cats,
                                n_needed, exclude_names=None):
-    """
-    Query places DB with fallback strategy:
-    1. Same state + predicted category
-    2. Same state + related categories
-
-    Within each tier, places are ranked by is_famous (Google Places /
-    anchor-list landmarks preferred) as a 'famous/established' proxy -
-    NOT by rating, since ratings in this dataset are inconsistent.
-    Beach & Island places get a soft secondary preference within the
-    same fame tier (see sort_for_beach_preference), since the smart
-    itinerary builder tries to place them in the morning/evening slot.
-
-    n_needed is used as a guide for how big a candidate pool to fetch,
-    NOT a hard cap on the final count - the smart time-budget allocator
-    (allocate_places_by_duration) decides how many of these candidates
-    actually fit into a day, since each place can now take a different
-    amount of time.
-    """
     if exclude_names is None:
         exclude_names = set()
 
-    # Fetch a larger pool than n_needed since each place may only take
-    # 1.5-4 hours - we want enough options for the day-filling step to
-    # choose from, especially once long-duration places (beach/island/
-    # adventure) start eating into the day's time budget. Capped at a
-    # reasonable ceiling (60) so a long, multi-day trip doesn't demand
-    # an unrealistically large candidate pool from a smaller state.
     pool_target = min(max(n_needed * 3, 12), 60)
 
     all_cands = pd.DataFrame()
 
-    # Priority 1: exact state + predicted category
     p1 = places[
         (places["state"] == user_state) &
         (places["category"] == predicted_cat) &
@@ -497,7 +409,6 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
     p1["match_quality"] = "exact"
     all_cands = pd.concat([all_cands, p1])
 
-    # Priority 2: same state + related categories
     if len(all_cands) < pool_target:
         for item in top3_cats[1:]:
             cat = item["category"]
@@ -516,9 +427,6 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
     if len(all_cands) == 0:
         return pd.DataFrame()
 
-    # State is a hard constraint. Never fill a short candidate pool
-    # with places from another state; a shorter in-state itinerary is
-    # more accurate than recommending an unrelated distant location.
     all_cands = all_cands[all_cands["state"] == user_state].copy()
     if all_cands.empty:
         return pd.DataFrame()
@@ -531,7 +439,6 @@ def query_places_for_activity(user_state, predicted_cat, top3_cats,
 
 
 def split_days(total_days, activities):
-    """Split days equally across activities."""
     n         = len(activities)
     base      = total_days // n
     remainder = total_days % n
@@ -541,35 +448,6 @@ def split_days(total_days, activities):
 
 def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: float = DAY_BUDGET_HOURS,
                                  start_hour: float = DAY_START_HOUR, places_used_so_far: int = 0):
-    """
-    Fill (part of) one day's time budget by walking down the (already
-    fame + beach-preference sorted) candidate list, taking each
-    place's own estimated duration (get_place_duration_hours) until
-    either the day's remaining hours run out or MAX_PLACES_PER_DAY
-    total places for the day have been scheduled (whichever comes
-    first) - cramming in 8-9 quick museum visits in one day isn't
-    realistic even if each is individually short.
-
-    IMPORTANT: when a day mixes multiple activities (e.g. Nature +
-    Adventure + Shopping all in the same day), this function is
-    called once per activity but must NOT reset the clock or the
-    place-count back to the start of the day each time - start_hour
-    and places_used_so_far carry that shared state forward across
-    calls within the same day (see the caller in /recommend).
-
-    Each place is also checked against its category's operating hours
-    (get_operating_hours): if starting it now would mean visiting
-    after closing time, or finishing after closing time, it's skipped
-    for this day (it stays in the candidate pool for a future day).
-
-    Accommodation-category places are NOT consumed from the day budget
-    here - they're handled separately as a "check-in" entry appended
-    at the end of the day (see pick_accommodation_checkin).
-
-    Returns (chosen_rows, remaining_candidates, current_hour,
-    remaining_budget, places_used_total) - the last three values are
-    meant to be threaded into the NEXT call for the same day.
-    """
     chosen = []
     used_indices = []
     current_hour = start_hour
@@ -580,21 +458,19 @@ def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: floa
         if places_used_total >= MAX_PLACES_PER_DAY:
             break
         if row.get("category") == "Accommodation":
-            continue  # handled separately as a check-in entry
+            continue
 
         duration = get_place_duration_hours(row)
         category = row.get("category", "")
         open_hour, close_hour = get_operating_hours(category)
 
-        # Can't start before opening (shouldn't happen since the day
-        # itself starts at DAY_START_HOUR, but kept for clarity/safety)
         effective_start = max(current_hour, open_hour)
         finish_hour = effective_start + duration
 
         if effective_start >= close_hour or finish_hour > close_hour:
-            continue  # would still be open past closing - skip for today
+            continue
         if duration > remaining_budget:
-            continue  # doesn't fit in what's left of the day budget
+            continue
 
         chosen.append((row, effective_start, duration))
         used_indices.append(idx)
@@ -609,14 +485,6 @@ def allocate_places_by_duration(candidates: pd.DataFrame, day_budget_hours: floa
 
 
 def pick_filler_stop(user_state: str, current_hour: float, remaining_budget: float, exclude_names: set):
-    """
-    If the day still has reasonable time left after hitting
-    MAX_PLACES_PER_DAY (or running out of suitable candidates) but
-    not enough to justify squeezing in another sightseeing stop, fill
-    it with a Food & Dining place instead - a relaxed meal/coffee
-    stop is a more realistic way to spend that time than cramming in
-    one more attraction.
-    """
     if remaining_budget < 1.0:
         return None, current_hour
 
@@ -645,13 +513,6 @@ def pick_filler_stop(user_state: str, current_hour: float, remaining_budget: flo
 
 
 def pick_accommodation_checkin(user_prefs: dict, user_state: str, exclude_names: set):
-    """
-    If the user's preferences suggest they care about where they stay
-    (Relaxation interest, or a Resort/Boutique-tier accommodation
-    preference), pick one Accommodation-category place in their state
-    to show as a "Check-in" entry at the end of the day. Returns None
-    if accommodation isn't relevant for this user, or no match exists.
-    """
     wants_accommodation_highlight = (
         user_prefs.get("activity_interest") == "Relaxation" or
         user_prefs.get("accommodation_preference") in ("Resort/Luxury Hotel", "Boutique Hotel")
@@ -672,7 +533,6 @@ def pick_accommodation_checkin(user_prefs: dict, user_state: str, exclude_names:
 
 
 def validate_request(data):
-    """Validate incoming request fields. Returns (is_valid, error_message)."""
     required = [
         "state", "budget_preference", "trip_duration",
         "group_type", "transportation_preference",
@@ -700,7 +560,6 @@ def validate_request(data):
     if data["accommodation_preference"] not in VALID_ACCOMMODATIONS:
         return False, f"Invalid accommodation. Choose from: {VALID_ACCOMMODATIONS}"
 
-    # activity_interest can be string or list
     activities = data["activity_interest"]
     if isinstance(activities, str):
         activities = [a.strip() for a in activities.split(",")]
@@ -717,7 +576,6 @@ def validate_request(data):
 
 @app.route("/", methods=["GET"])
 def health_check():
-    """Health check endpoint."""
     return jsonify({
         "status":  "ok",
         "app":     "CutiGo Trip Matching API",
@@ -729,7 +587,6 @@ def health_check():
 
 @app.route("/states", methods=["GET"])
 def get_states():
-    """Return all available states."""
     return jsonify({
         "status": "ok",
         "states": VALID_STATES
@@ -738,7 +595,6 @@ def get_states():
 
 @app.route("/activities", methods=["GET"])
 def get_activities():
-    """Return all available activity interests."""
     return jsonify({
         "status":     "ok",
         "activities": VALID_ACTIVITIES
@@ -747,7 +603,6 @@ def get_activities():
 
 @app.route("/options", methods=["GET"])
 def get_options():
-    """Return all valid options for every preference field."""
     return jsonify({
         "status": "ok",
         "options": {
@@ -762,22 +617,226 @@ def get_options():
     })
 
 
+# ================================================================
+# MYSQL ENDPOINTS - Places search + Saved Trips CRUD
+# ================================================================
+
+@app.route("/places", methods=["GET"])
+def search_places():
+    """
+    Search/filter places stored in MySQL (separate from the CSV used
+    by /recommend - this is for the Android "search place to add/edit
+    a trip slot" feature).
+
+    Query params:
+      name   (optional) - partial match on place_name, e.g. ?name=pantai
+      state  (optional) - exact match on state, e.g. ?state=Sabah
+      limit  (optional) - max rows to return, default 30, max 100
+    """
+    name = request.args.get("name", "").strip()
+    state = request.args.get("state", "").strip()
+    limit = min(int(request.args.get("limit", 30)), 100)
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+
+    query = "SELECT * FROM places WHERE 1=1"
+    params = []
+
+    if name:
+        query += " AND place_name LIKE %s"
+        params.append(f"%{name}%")
+
+    if state:
+        query += " AND state = %s"
+        params.append(state)
+
+    query += " ORDER BY is_famous DESC, rating_imputed DESC LIMIT %s"
+    params.append(limit)
+
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return jsonify({
+        "status": "ok",
+        "count": len(results),
+        "places": results,
+    })
+
+
+@app.route("/famous-places", methods=["GET"])
+def get_famous_places():
+    """Top N is_famous places (highest rated first), for the homepage carousel."""
+    limit = min(int(request.args.get("limit", 15)), 50)
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM places WHERE is_famous = 1 "
+        "ORDER BY rating_imputed DESC LIMIT %s",
+        (limit,)
+    )
+    results = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    return jsonify({"status": "ok", "count": len(results), "places": results})
+
+
+@app.route("/trips", methods=["POST"])
+def save_trip():
+    data = request.get_json()
+
+    if not data or "user_id" not in data:
+        return jsonify({"status": "error", "message": "user_id is required"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    cursor.execute(
+        """
+        INSERT INTO saved_trips
+            (user_id, state, title, tagline, budget_preference, trip_duration,
+             actual_days, group_type, transportation_preference,
+             accommodation_preference, activity_interest, itinerary_json)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            data.get("user_id"),
+            data.get("state"),
+            data.get("title"),
+            data.get("tagline"),
+            data.get("budget_preference"),
+            data.get("trip_duration"),
+            data.get("actual_days"),
+            data.get("group_type"),
+            data.get("transportation_preference"),
+            data.get("accommodation_preference"),
+            # activity_interest can arrive as a list ["Nature","Food"] or
+            # a pre-joined string "Nature, Food" - normalise to string.
+            (", ".join(data["activity_interest"])
+             if isinstance(data.get("activity_interest"), list)
+             else str(data.get("activity_interest", ""))),
+            json_lib.dumps(data.get("itinerary", [])),
+        )
+    )
+    conn.commit()
+    new_trip_id = cursor.lastrowid
+    cursor.close()
+    conn.close()
+
+    return jsonify({"status": "ok", "trip_id": new_trip_id})
+
+
+@app.route("/trips", methods=["GET"])
+def get_trips():
+    user_id = request.args.get("user_id", "").strip()
+
+    if not user_id:
+        return jsonify({"status": "error", "message": "user_id is required"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT * FROM saved_trips WHERE user_id = %s ORDER BY created_at DESC",
+        (user_id,)
+    )
+    trips = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    for trip in trips:
+        if trip.get("itinerary_json"):
+            trip["itinerary"] = json_lib.loads(trip["itinerary_json"])
+            del trip["itinerary_json"]
+        if trip.get("created_at"):
+            trip["created_at"] = str(trip["created_at"])
+
+    return jsonify({"status": "ok", "count": len(trips), "trips": trips})
+
+
+@app.route("/trips/<int:trip_id>", methods=["PUT"])
+def update_trip(trip_id):
+    data = request.get_json()
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    allowed_fields = {
+        "state": "state", "title": "title", "tagline": "tagline",
+        "budget_preference": "budget_preference", "trip_duration": "trip_duration",
+        "actual_days": "actual_days", "group_type": "group_type",
+        "transportation_preference": "transportation_preference",
+        "accommodation_preference": "accommodation_preference",
+    }
+    set_parts = []
+    params = []
+    for key, column in allowed_fields.items():
+        if key in data:
+            set_parts.append(f"{column} = %s")
+            params.append(data[key])
+
+    if "activity_interest" in data:
+        set_parts.append("activity_interest = %s")
+        params.append(", ".join(data["activity_interest"]))
+
+    if "itinerary" in data:
+        set_parts.append("itinerary_json = %s")
+        params.append(json_lib.dumps(data["itinerary"]))
+
+    if not set_parts:
+        cursor.close()
+        conn.close()
+        return jsonify({"status": "error", "message": "No valid fields to update"}), 400
+
+    params.append(trip_id)
+    query = f"UPDATE saved_trips SET {', '.join(set_parts)} WHERE trip_id = %s"
+    cursor.execute(query, params)
+    conn.commit()
+    affected = cursor.rowcount
+    cursor.close()
+    conn.close()
+
+    if affected == 0:
+        return jsonify({"status": "error", "message": "Trip not found"}), 404
+
+    return jsonify({"status": "ok", "trip_id": trip_id, "updated": True})
+
+
+@app.route("/trips/<int:trip_id>", methods=["DELETE"])
+def delete_trip(trip_id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM saved_trips WHERE trip_id = %s", (trip_id,))
+    conn.commit()
+    affected = cursor.rowcount
+    cursor.close()
+    conn.close()
+
+    if affected == 0:
+        return jsonify({"status": "error", "message": "Trip not found"}), 404
+
+    return jsonify({"status": "ok", "trip_id": trip_id, "deleted": True})
+
+
+# ================================================================
+# MAIN RECOMMEND ENDPOINT (unchanged logic from the previous version)
+# ================================================================
+
 @app.route("/recommend", methods=["POST"])
 def recommend():
-    """
-    Main recommendation endpoint.
-    """
-    # ── Parse request ─────────────────────────────────────────────
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No JSON body received"}), 400
 
-    # ── Validate ──────────────────────────────────────────────────
     is_valid, err = validate_request(data)
     if not is_valid:
         return jsonify({"status": "error", "message": err}), 400
 
-    # ── Normalise activities ──────────────────────────────────────
     raw_activities = data["activity_interest"]
     if isinstance(raw_activities, str):
         activities = [a.strip() for a in raw_activities.split(",") if a.strip()]
@@ -790,20 +849,13 @@ def recommend():
     user_prefs = {
         "state":                     data["state"],
         "budget_preference":         data["budget_preference"],
-        "activity_interest":         activities[0],  # for encoding
+        "activity_interest":         activities[0],
         "trip_duration":             data["trip_duration"],
         "group_type":                data["group_type"],
         "transportation_preference": data["transportation_preference"],
         "accommodation_preference":  data["accommodation_preference"],
     }
 
-    # ── Days calculation ──────────────────────────────────────────
-    # trip_duration is a category bucket (Half Day / 1 Day / 2-3 Days /
-    # 4-7 Days / 1 Week+) used for the ML model's prediction. The
-    # ACTUAL number of itinerary days to build comes from actual_days
-    # when the client provides it (e.g. 2, not the "2-3 Days" bucket's
-    # fixed default of 3) - this fixes picking exactly N days
-    # producing an itinerary with the wrong number of days.
     duration   = data["trip_duration"]
     actual_days = data.get("actual_days")
 
@@ -817,18 +869,12 @@ def recommend():
         except (TypeError, ValueError):
             total_int = int(DURATION_TO_DAYS.get(duration, 1))
     else:
-        # Fallback for older clients that don't send actual_days yet
         total_days = DURATION_TO_DAYS.get(duration, 1)
         total_int = 1 if total_days == 0.5 else int(total_days)
 
-    # ── Day → activity mapping ────────────────────────────────────
-    # Every day mixes ALL selected activities together (e.g. a trip
-    # with Nature + Adventure + Shopping gets some of each on every
-    # day), rather than dedicating entire days to a single activity.
     allocation = {}
     day_activity_map = {day: activities for day in range(1, total_int + 1)}
 
-    # ── ML Predictions ────────────────────────────────────────────
     act_preds = {}
     ai_predictions = []
     for act in activities:
@@ -841,25 +887,12 @@ def recommend():
             "top3":               top3,
         })
 
-    # ── Query places (fetch a generous pool per activity) ─────────
     used       = set()
     act_pools  = {}
     for act in activities:
         cat   = act_preds[act]["category"]
         top3  = act_preds[act]["top3"]
-        # Since every day now mixes all activities, each activity's
-        # pool needs to cover places across the WHOLE trip length
-        # (not just a slice of days like the old per-activity-day
-        # allocation did).
-        # Each day can use up to MAX_PLACES_PER_DAY places, and with
-        # round-robin sharing across multiple activities, a generous
-        # multiplier is needed so later days don't run out of
-        # candidates even on longer trips.
         n_need = max(total_int * MAX_PLACES_PER_DAY * 2, 20)
-        # Search the category explicitly requested by the user first.
-        # Keep the model's remaining top categories as same-state
-        # fallbacks, preserving the existing ML behaviour when the
-        # requested category has only a small number of places.
         query_cat = ACTIVITY_PRIMARY_CATEGORIES.get(act, cat)
         query_top3 = [{"category": query_cat, "confidence": 100.0}]
         query_top3.extend(
@@ -875,13 +908,7 @@ def recommend():
             exclude_names = used,
         )
         act_pools[act] = matched
-        # Do not mark the whole candidate pool as used here. Doing so
-        # lets the first activity reserve places that it may never
-        # schedule, starving later activities (for example Heritage
-        # reserving Central Market/TRX before Shopping gets its turn).
-        # A name becomes used only when it is actually scheduled below.
 
-    # ── Build itinerary JSON using the smart duration allocator ────
     itinerary  = []
     all_places = []
 
@@ -892,34 +919,14 @@ def recommend():
         day_places_list = []
         day_used_names = set()
 
-        # Shared state across all of today's activities - this is
-        # what makes "mix all activities into one day" actually work:
-        # without carrying this forward, each activity would otherwise
-        # get its own fresh 14-hour day (effectively cramming several
-        # days' worth of places into one).
         day_current_hour = DAY_START_HOUR
         day_remaining_budget = 7.0 if is_half else DAY_BUDGET_HOURS
         day_places_used = 0
 
-        # Round-robin across today's activities - take ONE place from
-        # each activity's pool in turn, looping back around, instead
-        # of letting the first activity (e.g. Nature) consume the
-        # entire day's budget before the others ever get a turn. This
-        # is what actually makes "mix all activities into one day"
-        # work fairly.
-        #
-        # Implemented with simple per-activity row pointers (not a
-        # while-loop draining pools) so it's guaranteed to terminate:
-        # each activity's pointer only moves forward, and the outer
-        # loop runs at most len(day_acts) * MAX_PLACES_PER_DAY times.
         act_pointers = {act: 0 for act in day_acts}
         act_rows = {act: act_pools[act].reset_index(drop=True) for act in day_acts}
         act_deferred_rows = {act: [] for act in day_acts}
 
-        # Spread a limited pool across all remaining trip days instead
-        # of consuming six places early and leaving later days empty.
-        # Examples: 12 unique places / 4 days -> 3 per day;
-        # 8 unique places / 4 days -> 2 per day.
         days_remaining = total_int - day_num + 1
         remaining_unique_names = set()
         for act in day_acts:
@@ -943,7 +950,7 @@ def recommend():
         else:
             day_place_limit = 0
 
-        max_rounds = MAX_PLACES_PER_DAY + 2  # small safety margin
+        max_rounds = MAX_PLACES_PER_DAY + 2
         for _round in range(max_rounds):
 
             if day_places_used >= day_place_limit or day_remaining_budget <= 0.5:
@@ -959,9 +966,6 @@ def recommend():
                 rows = act_rows[act]
                 ptr = act_pointers[act]
 
-                # Find the next row for this activity that actually
-                # fits (skip ones that fail operating-hours/budget
-                # checks, without ever moving ptr backward).
                 placed = False
                 scanned_this_round = 0
                 while (
@@ -980,34 +984,31 @@ def recommend():
                     if name in used or name in day_used_names:
                         continue
 
-                    # Defence-in-depth: even if a future query/fallback
-                    # accidentally adds another state to an activity
-                    # pool, it must never reach the itinerary response.
                     candidate_state = str(candidate_row.get("state", "")).strip()
                     if candidate_state != data["state"]:
                         continue
 
-                    duration = get_place_duration_hours(candidate_row)
+                    duration_h = get_place_duration_hours(candidate_row)
                     category = candidate_row.get("category", "")
                     open_hour, close_hour = get_operating_hours(category)
 
                     effective_start = max(day_current_hour, open_hour)
-                    finish_hour = effective_start + duration
+                    finish_hour = effective_start + duration_h
 
                     if effective_start >= close_hour or finish_hour > close_hour:
                         act_deferred_rows[act].append(candidate_row)
                         continue
-                    if duration > day_remaining_budget:
+                    if duration_h > day_remaining_budget:
                         act_deferred_rows[act].append(candidate_row)
                         continue
 
                     state = candidate_state
                     link, link_type = get_more_info_link(candidate_row, name, state)
                     place_obj = {
-                        "time_slot":     format_time_range(effective_start, duration),
+                        "time_slot":     format_time_range(effective_start, duration_h),
                         "place_name":    name,
                         "category":      str(candidate_row.get("category", "")),
-                        "duration_hours": duration,
+                        "duration_hours": duration_h,
                         "rating":        round(float(candidate_row.get("rating_imputed", 0)), 1),
                         "more_info_url": link,
                         "link_type":     link_type,
@@ -1020,21 +1021,18 @@ def recommend():
                     used.add(name)
 
                     day_current_hour = finish_hour
-                    day_remaining_budget -= duration
+                    day_remaining_budget -= duration_h
                     day_places_used += 1
 
                     placed = True
                     made_progress_this_round = True
-                    break  # this activity gets exactly one place this round
+                    break
 
                 act_pointers[act] = ptr
 
             if not made_progress_this_round:
-                break  # no activity could place anything this round - stop early
+                break
 
-        # Carry forward both untried rows and rows that did not fit
-        # today's time/operating-hour constraints. Deferred rows are
-        # placed first because they may fit naturally tomorrow morning.
         for act in day_acts:
             used_ptr = act_pointers[act]
             deferred_df = pd.DataFrame(act_deferred_rows[act])
@@ -1046,9 +1044,6 @@ def recommend():
                 )
             act_pools[act] = carried.reset_index(drop=True)
 
-        # If the day still has worthwhile time left after the main
-        # activity places, use it for a food/relax stop rather than
-        # squeezing in more sightseeing.
         filler, _ = pick_filler_stop(
             user_state=data["state"],
             current_hour=day_current_hour,
@@ -1076,10 +1071,6 @@ def recommend():
             day_used_names.add(f_name)
             used.add(f_name)
 
-        # ── Accommodation check-in (only on Day 1, and only if
-        # relevant to this user) - a real traveller checks into their
-        # hotel/resort once at the start of the trip, not every single
-        # day, so this is intentionally NOT repeated for day_num > 1.
         if day_num == 1:
             primary_act = day_acts[0]
             checkin_row = pick_accommodation_checkin(
@@ -1106,10 +1097,6 @@ def recommend():
                 all_places.append(checkin_obj)
                 used.add(name)
 
-        # A more descriptive label than the generic "Mixed" - since
-        # every day now combines all selected activities, joining
-        # their names (e.g. "Nature & Shopping") is far more useful
-        # to show in the UI than a vague "Mixed".
         if len(day_acts) == 1:
             day_activity_label = day_acts[0]
             day_predicted_category = act_preds[day_acts[0]]["category"]
@@ -1127,7 +1114,6 @@ def recommend():
             "places":             day_places_list,
         })
 
-    # ── Trip summary ──────────────────────────────────────────────
     avg_rating = round(float(np.mean([p["rating"] for p in all_places])), 2) if all_places else 0.0
     day_alloc  = [
         {"activity": act, "days": n, "category": act_preds[act]["category"]}
@@ -1152,7 +1138,6 @@ def recommend():
         "accommodation":  data["accommodation_preference"],
     }
 
-    # ── Return response ───────────────────────────────────────────
     return jsonify({
         "status":           "ok",
         "user_preferences": data,
