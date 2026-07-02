@@ -270,7 +270,7 @@ ICONIC_PLACE_PRIORITY = {
     "national mosque": 83,
     "george town street art": 82,
     "mabul island": 81,
-    "penang hill heritage trail": 81,
+    "penang hill railway": 81,
     "crystal mosque": 80,
     "sarawak cultural village": 79,
     "poring hot springs": 78,
