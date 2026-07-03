@@ -687,7 +687,6 @@ def get_famous_places():
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
     cursor.execute(
-       cursor.execute(
     "SELECT * FROM places WHERE is_famous = 1 AND image_url IS NOT NULL "
     "ORDER BY rating_imputed DESC LIMIT %s",
     (limit,)
