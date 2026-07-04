@@ -644,11 +644,11 @@ def search_places():
     Query params:
       name   (optional) - partial match on place_name, e.g. ?name=pantai
       state  (optional) - exact match on state, e.g. ?state=Sabah
-      limit  (optional) - max rows to return, default 30, max 100
+      limit  (optional) - max rows to return, default 30, max 300
     """
     name = request.args.get("name", "").strip()
     state = request.args.get("state", "").strip()
-    limit = min(int(request.args.get("limit", 30)), 100)
+    limit = min(int(request.args.get("limit", 30)), 300)
 
     conn = get_db_connection()
     cursor = conn.cursor(dictionary=True)
